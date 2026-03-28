@@ -170,9 +170,22 @@
     .leader-meta { color: var(--muted); margin-top: 4px; font-size: 0.8rem; }
     .leader-score { font-weight: 800; white-space: nowrap; }
     .empty { color: var(--muted); text-align: center; padding: 18px 8px 10px; }
-    .server-status { margin-top: 6px; text-align: center; }
-    .server-status.good { color: #91f0be; }
-    .server-status.bad { color: #ffb2bf; }
+    .server-status {
+      margin: 8px auto 0;
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.18);
+      box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.05);
+    }
+    .server-status.good {
+      background: #22cb86;
+      box-shadow: 0 0 0 4px rgba(34, 203, 134, 0.16);
+    }
+    .server-status.bad {
+      background: #ff6b7f;
+      box-shadow: 0 0 0 4px rgba(255, 107, 127, 0.14);
+    }
     .summary-panel { display: none; }
     .summary-panel.visible { display: block; }
     .summary-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
@@ -272,7 +285,7 @@
       <div class="hero-copy">
         <p class="eyebrow">IIT Gandhinagar</p>
         <h1>Redline IQ</h1>
-        <p>Built for reflexes, engineered for bragging rights.</p>
+          <p>Built for reflexes, tuned for the podium.</p>
       </div>
       <div class="stats">
         <div class="stat"><span>Questions</span><strong>15</strong></div>
@@ -331,13 +344,12 @@
         </section>
       </div>
 
-      <section class="leaderboard-panel card">
-        <div class="section-head">
-          <h2>Hall Of Pace</h2>
-          <div class="pill">Always On</div>
-        </div>
-        <p class="tiny">See who set the pace and who still has ground to make up.</p>
-        <p class="tiny server-status" id="serverStatus">Connecting to live scoreboard...</p>
+        <section class="leaderboard-panel card">
+          <div class="section-head">
+            <h2>Hall Of Pace</h2>
+          </div>
+          <p class="tiny">See who set the pace and who still has ground to make up.</p>
+          <div class="server-status bad" id="serverStatus" aria-label="Server status" title="Connecting to live scoreboard"></div>
         <div class="leaderboard-controls">
           <div class="toggle-row">
             <button class="toggle-chip active" id="overallLeaderboardBtn" type="button">Overall</button>

@@ -201,6 +201,7 @@ const STORAGE_PREFIX = `mokshaQuiz:${STORAGE_VERSION}`;
 const DEVICE_KEY = `${STORAGE_PREFIX}:device`;
 const ATTEMPT_ID_KEY = `${STORAGE_PREFIX}:attemptId`;
 const NAME_KEY = `${STORAGE_PREFIX}:name`;
+const NAME_DRAFT_KEY = `${STORAGE_PREFIX}:nameDraft`;
 const EMAIL_KEY = `${STORAGE_PREFIX}:email`;
 const EMAIL_VERIFIED_KEY = `${STORAGE_PREFIX}:emailVerified`;
 const ATTEMPT_CACHE_KEY = `${STORAGE_PREFIX}:attemptCache`;
@@ -219,6 +220,7 @@ runOneTimeResetSweep();
 
 const state = {
   playerName: "",
+  nameDraft: localStorage.getItem(NAME_DRAFT_KEY) || "",
   currentSectionIndex: null,
   currentQuestionIndex: 0,
   totalScore: 0,
@@ -301,6 +303,11 @@ async function init() {
 
 function bindEvents() {
   el.saveNameBtn.addEventListener("click", saveName);
+  el.playerName.addEventListener("input", () => {
+    if (state.locked) return;
+    state.nameDraft = el.playerName.value;
+    localStorage.setItem(NAME_DRAFT_KEY, state.nameDraft);
+  });
   el.playerName.addEventListener("keydown", (event) => {
     if (event.key === "Enter") saveName();
   });
@@ -343,9 +350,10 @@ function bindEvents() {
 
 function restoreNameCache() {
   const cachedName = localStorage.getItem(NAME_KEY);
-  if (!cachedName) return;
-  state.playerName = cachedName;
-  el.playerName.value = cachedName;
+  const draftName = localStorage.getItem(NAME_DRAFT_KEY) || "";
+  if (cachedName) state.playerName = cachedName;
+  state.nameDraft = draftName || cachedName || "";
+  if (state.nameDraft) el.playerName.value = state.nameDraft;
 }
 
 function restoreEmailCache() {
@@ -472,23 +480,32 @@ function applyAttemptRecord(record) {
     state.startedAt = null;
     state.email = normalizeEmail(el.iitgnEmail.value || state.email);
     if (state.email) localStorage.setItem(EMAIL_KEY, state.email);
-    if (!state.playerName) el.playerName.value = "";
+    state.nameDraft = el.playerName.value || state.nameDraft || state.playerName || "";
+    localStorage.setItem(NAME_DRAFT_KEY, state.nameDraft);
+    if (!state.playerName && !state.nameDraft) el.playerName.value = "";
     el.playerName.disabled = false;
     el.saveNameBtn.disabled = false;
-    if (state.playerName) el.playerName.value = state.playerName;
+    if (state.nameDraft) el.playerName.value = state.nameDraft;
     el.attemptNotice.style.display = "none";
     updateAuthUI();
     return;
   }
 
-  state.locked = true;
-  state.sessionUnlocked = true;
+  const hasStartedAttempt = Boolean(
+    record.quizStarted ||
+    (Array.isArray(record.completedSections) && record.completedSections.length) ||
+    Number(record.totalScore || 0) ||
+    Number.isInteger(record.inProgressSectionIndex)
+  );
+
+  state.locked = hasStartedAttempt;
+  state.sessionUnlocked = hasStartedAttempt;
   state.attemptId = record.deviceId || state.attemptId || state.deviceId;
   localStorage.setItem(ATTEMPT_ID_KEY, state.attemptId);
   state.email = normalizeEmail(record.verifiedEmail || state.email);
   state.emailVerified = Boolean(record.verifiedEmail);
   if (state.emailVerified) localStorage.setItem(EMAIL_VERIFIED_KEY, "1");
-  state.quizStarted = Boolean(record.quizStarted || (Array.isArray(record.completedSections) && record.completedSections.length) || Number(record.totalScore || 0));
+  state.quizStarted = hasStartedAttempt;
   state.playerName = record.playerName || state.playerName;
   state.totalScore = Number(record.totalScore) || 0;
   state.sectionScores = record.sectionScores || {};
@@ -507,6 +524,8 @@ function applyAttemptRecord(record) {
 
   if (state.playerName) {
     localStorage.setItem(NAME_KEY, state.playerName);
+    state.nameDraft = state.playerName;
+    localStorage.setItem(NAME_DRAFT_KEY, state.nameDraft);
     el.playerName.value = state.playerName;
   }
   if (state.email) {
@@ -514,8 +533,8 @@ function applyAttemptRecord(record) {
     el.iitgnEmail.value = state.email;
   }
 
-  el.playerName.disabled = true;
-  el.saveNameBtn.disabled = true;
+  el.playerName.disabled = hasStartedAttempt;
+  el.saveNameBtn.disabled = hasStartedAttempt;
   el.attemptNotice.style.display = "block";
   el.attemptNotice.textContent = state.completedAll
     ? "This IITGN account has already completed all sections for the current live leaderboard session."
@@ -543,6 +562,7 @@ function clearAttemptCache() {
   localStorage.removeItem(ATTEMPT_ID_KEY);
   localStorage.removeItem(EMAIL_KEY);
   localStorage.removeItem(EMAIL_VERIFIED_KEY);
+  localStorage.removeItem(NAME_DRAFT_KEY);
 }
 
 function saveName() {
@@ -553,7 +573,9 @@ function saveName() {
     return;
   }
   state.playerName = value;
+  state.nameDraft = value;
   localStorage.setItem(NAME_KEY, value);
+  localStorage.setItem(NAME_DRAFT_KEY, value);
   updateHeaderBits();
   el.nameHint.textContent = `${value} is ready for the grid.`;
   renderSections();
@@ -771,14 +793,14 @@ function closeQuizView() {
   clearTimer();
   if (state.currentSectionIndex !== null) {
     const section = quizData[state.currentSectionIndex];
-    if (state.awaitingNext) {
-      if (state.currentQuestionIndex >= section.questions.length - 1) {
-        finishSection();
-        return;
-      }
-      state.currentQuestionIndex += 1;
-      state.awaitingNext = false;
+    if (state.currentQuestionIndex >= section.questions.length - 1 && state.awaitingNext) {
+      finishSection();
+      return;
     }
+    if (state.currentQuestionIndex < section.questions.length - 1) {
+      state.currentQuestionIndex += 1;
+    }
+    state.awaitingNext = false;
     cacheAttemptLocally();
     updateLocalLeaderboardSnapshot();
     void syncAttemptToServer();
@@ -1047,9 +1069,10 @@ function formatSectionOnly(entry, sectionIndex) {
 }
 
 function setServerStatus(message, good) {
-  el.serverStatus.textContent = message;
   el.serverStatus.classList.toggle("good", Boolean(good));
   el.serverStatus.classList.toggle("bad", !good);
+  el.serverStatus.setAttribute("title", message || (good ? "Server online" : "Server offline"));
+  el.serverStatus.setAttribute("aria-label", message || (good ? "Server online" : "Server offline"));
 }
 
 async function fetchJSON(url, options) {
