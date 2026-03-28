@@ -97,7 +97,17 @@ async function handleApi(req, res, requestUrl) {
     }
 
     const otp = generateOtp();
-    await sendOtpEmail(email, otp, String(payload.playerName).trim());
+    try {
+      await sendOtpEmail(email, otp, String(payload.playerName).trim());
+    } catch (error) {
+      console.error("OTP send failed:", error);
+      sendJson(res, 503, {
+        error: error && error.message
+          ? error.message
+          : "OTP email could not be sent right now."
+      });
+      return;
+    }
     store.otpChallenges[email] = {
       email,
       otpHash: hashOtp(email, otp),
