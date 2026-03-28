@@ -3,9 +3,23 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { URL } = require("url");
+let nodemailer = null;
+try {
+  nodemailer = require("nodemailer");
+} catch (error) {
+  nodemailer = null;
+}
 
 const PORT = Number(process.env.PORT || 3000);
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "change-me";
+const SMTP_HOST = process.env.SMTP_HOST || "";
+const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
+const SMTP_SECURE = String(process.env.SMTP_SECURE || "false").toLowerCase() === "true";
+const SMTP_USER = process.env.SMTP_USER || "";
+const SMTP_PASS = process.env.SMTP_PASS || "";
+const SMTP_FROM = process.env.SMTP_FROM || SMTP_USER || "";
+const OTP_TTL_MS = Number(process.env.OTP_TTL_MS || 10 * 60 * 1000);
+const OTP_COOLDOWN_MS = Number(process.env.OTP_COOLDOWN_MS || 45 * 1000);
 const ROOT = __dirname;
 const DATA_DIR = path.join(ROOT, "data");
 const STORE_FILE = path.join(DATA_DIR, "quiz-store.json");
@@ -51,7 +65,7 @@ async function handleApi(req, res, requestUrl) {
       : { deviceId: requestUrl.searchParams.get("deviceId") || "" };
     const store = readStore();
     const leaderboard = buildLeaderboard(store);
-    const attempt = findMatchingAttempt(store, payload, req);
+    const attempt = findAttemptByEmail(store, payload.verifiedEmail || payload.email || "") || null;
     sendJson(res, 200, {
       sessionId: store.sessionId,
       leaderboard,
@@ -60,37 +74,177 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
-  if (req.method === "POST" && requestUrl.pathname === "/api/progress") {
+  if (req.method === "POST" && requestUrl.pathname === "/api/auth/request-otp") {
     const body = await readBody(req);
     const payload = JSON.parse(body || "{}");
+    const email = normalizeEmail(payload.email);
+    if (!isValidIitgnEmail(email)) {
+      sendJson(res, 400, { error: "Use an IITGN email ending with @iitgn.ac.in." });
+      return;
+    }
+    if (!String(payload.playerName || "").trim()) {
+      sendJson(res, 400, { error: "Player name is required before requesting OTP." });
+      return;
+    }
 
-    if (!payload.deviceId || !payload.playerName) {
-      sendJson(res, 400, { error: "deviceId and playerName are required." });
+    const store = readStore();
+
+    const currentChallenge = store.otpChallenges[email];
+    const nowMs = Date.now();
+    if (currentChallenge && nowMs - new Date(currentChallenge.requestedAt).getTime() < OTP_COOLDOWN_MS) {
+      sendJson(res, 429, { error: "Please wait a few seconds before requesting a new OTP." });
+      return;
+    }
+
+    const otp = generateOtp();
+    await sendOtpEmail(email, otp, String(payload.playerName).trim());
+    store.otpChallenges[email] = {
+      email,
+      otpHash: hashOtp(email, otp),
+      requestedAt: new Date(nowMs).toISOString(),
+      expiresAt: new Date(nowMs + OTP_TTL_MS).toISOString(),
+      attempts: 0,
+      playerName: String(payload.playerName).trim().slice(0, 30)
+    };
+    writeStore(store);
+
+    sendJson(res, 200, {
+      ok: true,
+      email,
+      expiresInMs: OTP_TTL_MS
+    });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/auth/verify-otp") {
+    const body = await readBody(req);
+    const payload = JSON.parse(body || "{}");
+    const email = normalizeEmail(payload.email);
+    const otp = String(payload.otp || "").trim();
+    const playerName = String(payload.playerName || "").trim().slice(0, 30);
+
+    if (!playerName) {
+      sendJson(res, 400, { error: "Player name is required." });
+      return;
+    }
+    if (!isValidIitgnEmail(email)) {
+      sendJson(res, 400, { error: "Use an IITGN email ending with @iitgn.ac.in." });
+      return;
+    }
+    if (!/^\d{6}$/.test(otp)) {
+      sendJson(res, 400, { error: "Enter the 6-digit OTP sent to your IITGN email." });
       return;
     }
 
     const store = readStore();
     const now = new Date().toISOString();
-    const matchedRecord = findMatchingAttempt(store, payload, req);
-    const attemptId = matchedRecord?.deviceId || String(payload.attemptId || payload.deviceId || createAttemptId());
-    const browserId = String(payload.browserId || payload.deviceId || "");
-    const matchHints = buildMatchHints(payload.deviceProfile);
+    const challenge = store.otpChallenges[email];
+    if (!challenge) {
+      sendJson(res, 400, { error: "Request a fresh OTP for this IITGN email first." });
+      return;
+    }
+    if (new Date(challenge.expiresAt).getTime() < Date.now()) {
+      delete store.otpChallenges[email];
+      writeStore(store);
+      sendJson(res, 410, { error: "That OTP has expired. Request a new one." });
+      return;
+    }
+    if (challenge.attempts >= 5) {
+      delete store.otpChallenges[email];
+      writeStore(store);
+      sendJson(res, 429, { error: "Too many incorrect OTP attempts. Request a new code." });
+      return;
+    }
+    if (hashOtp(email, otp) !== challenge.otpHash) {
+      challenge.attempts += 1;
+      writeStore(store);
+      sendJson(res, 401, { error: "Incorrect OTP. Please try again." });
+      return;
+    }
+
+    const existingEmailRecord = findAttemptByEmail(store, email);
+    if (existingEmailRecord) {
+      delete store.otpChallenges[email];
+      existingEmailRecord.playerName = playerName || existingEmailRecord.playerName;
+      existingEmailRecord.updatedAt = now;
+      writeStore(store);
+      sendJson(res, 200, {
+        ok: true,
+        sessionId: store.sessionId,
+        attempt: existingEmailRecord,
+        leaderboard: buildLeaderboard(store)
+      });
+      return;
+    }
+
+    const attemptId = String(payload.attemptId || createAttemptId());
+    const record = {
+      sessionId: store.sessionId,
+      deviceId: attemptId,
+      playerName,
+      verifiedEmail: email,
+      emailVerifiedAt: now,
+      quizStarted: false,
+      totalScore: 0,
+      sectionScores: {},
+      completedSections: [],
+      completedAll: false,
+      inProgressSectionIndex: null,
+      inProgressQuestionIndex: null,
+      startedAt: now,
+      updatedAt: now
+    };
+
+    store.attempts[attemptId] = record;
+    delete store.otpChallenges[email];
+    writeStore(store);
+
+    sendJson(res, 200, {
+      ok: true,
+      sessionId: store.sessionId,
+      attempt: record,
+      leaderboard: buildLeaderboard(store)
+    });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/progress") {
+    const body = await readBody(req);
+    const payload = JSON.parse(body || "{}");
+
+    if (!payload.playerName || !payload.verifiedEmail) {
+      sendJson(res, 400, { error: "playerName and verifiedEmail are required." });
+      return;
+    }
+
+    const store = readStore();
+    const now = new Date().toISOString();
+    const verifiedEmail = normalizeEmail(payload.verifiedEmail);
+    if (!isValidIitgnEmail(verifiedEmail)) {
+      sendJson(res, 400, { error: "Use a verified IITGN email ending with @iitgn.ac.in." });
+      return;
+    }
+    const matchedRecord = findAttemptByEmail(store, verifiedEmail);
+    if (!matchedRecord) {
+      sendJson(res, 403, { error: "Verify your IITGN email with OTP before starting the quiz." });
+      return;
+    }
+    const attemptId = matchedRecord.deviceId;
     const record = {
       sessionId: store.sessionId,
       deviceId: attemptId,
       playerName: String(payload.playerName).trim().slice(0, 30),
+      verifiedEmail,
+      emailVerifiedAt: matchedRecord.emailVerifiedAt || now,
+      quizStarted: Boolean(payload.quizStarted || matchedRecord.quizStarted || Number(payload.totalScore || 0) || (Array.isArray(payload.completedSections) && payload.completedSections.length)),
       totalScore: Number(payload.totalScore || 0),
       sectionScores: payload.sectionScores && typeof payload.sectionScores === "object" ? payload.sectionScores : {},
       completedSections: Array.isArray(payload.completedSections) ? payload.completedSections : [],
       completedAll: Boolean(payload.completedAll),
       inProgressSectionIndex: Number.isInteger(payload.inProgressSectionIndex) ? payload.inProgressSectionIndex : null,
       inProgressQuestionIndex: Number.isInteger(payload.inProgressQuestionIndex) ? payload.inProgressQuestionIndex : null,
-      startedAt: matchedRecord?.startedAt || payload.startedAt || now,
-      updatedAt: now,
-      browserIds: uniqueList([...(matchedRecord?.browserIds || []), browserId].filter(Boolean)),
-      deviceStableKey: String(payload.deviceProfile?.stableKey || matchedRecord?.deviceStableKey || ""),
-      matchHints,
-      lastSeenIp: extractClientIp(req)
+      startedAt: matchedRecord.startedAt || payload.startedAt || now,
+      updatedAt: now
     };
 
     store.attempts[record.deviceId] = record;
@@ -115,7 +269,8 @@ async function handleApi(req, res, requestUrl) {
 
     const store = {
       sessionId: createSessionId(),
-      attempts: {}
+      attempts: {},
+      otpChallenges: {}
     };
     writeStore(store);
 
@@ -162,14 +317,20 @@ function ensureStore() {
   if (!fs.existsSync(STORE_FILE)) {
     writeStore({
       sessionId: createSessionId(),
-      attempts: {}
+      attempts: {},
+      otpChallenges: {}
     });
   }
 }
 
 function readStore() {
   ensureStore();
-  return JSON.parse(fs.readFileSync(STORE_FILE, "utf8"));
+  const parsed = JSON.parse(fs.readFileSync(STORE_FILE, "utf8"));
+  return {
+    sessionId: parsed.sessionId || createSessionId(),
+    attempts: parsed.attempts && typeof parsed.attempts === "object" ? parsed.attempts : {},
+    otpChallenges: parsed.otpChallenges && typeof parsed.otpChallenges === "object" ? parsed.otpChallenges : {}
+  };
 }
 
 function writeStore(store) {
@@ -179,112 +340,21 @@ function writeStore(store) {
 }
 
 function buildLeaderboard(store) {
-  return Object.values(store.attempts).sort((a, b) => {
-    if (Number(b.totalScore || 0) !== Number(a.totalScore || 0)) {
-      return Number(b.totalScore || 0) - Number(a.totalScore || 0);
-    }
-    return new Date(a.updatedAt || 0) - new Date(b.updatedAt || 0);
-  }).slice(0, 100);
+  return Object.values(store.attempts)
+    .filter((record) => Boolean(record.quizStarted || Number(record.totalScore || 0) || (Array.isArray(record.completedSections) && record.completedSections.length)))
+    .sort((a, b) => {
+      if (Number(b.totalScore || 0) !== Number(a.totalScore || 0)) {
+        return Number(b.totalScore || 0) - Number(a.totalScore || 0);
+      }
+      return new Date(a.updatedAt || 0) - new Date(b.updatedAt || 0);
+    })
+    .slice(0, 100);
 }
 
-function findMatchingAttempt(store, payload, req) {
-  const attempts = Object.values(store.attempts || {});
-  if (!attempts.length) return null;
-
-  const explicitIds = uniqueList([
-    payload?.attemptId,
-    payload?.deviceId,
-    payload?.browserId
-  ].filter(Boolean).map(String));
-
-  for (const id of explicitIds) {
-    if (store.attempts[id]) return store.attempts[id];
-  }
-
-  const stableKey = String(payload?.deviceProfile?.stableKey || "");
-  if (stableKey) {
-    const exactStableMatch = attempts.find((record) => record.deviceStableKey && record.deviceStableKey === stableKey);
-    if (exactStableMatch) return exactStableMatch;
-  }
-
-  const candidateHints = buildMatchHints(payload?.deviceProfile);
-  const clientIp = extractClientIp(req);
-  let best = null;
-  let bestScore = 0;
-
-  for (const record of attempts) {
-    const { score, anchors } = scoreAttemptMatch(record, candidateHints, clientIp);
-    if (score > bestScore || (score === bestScore && anchors > (best?.anchors || 0))) {
-      best = { record, anchors };
-      bestScore = score;
-    }
-  }
-
-  if (best && bestScore >= 70 && best.anchors >= 3) {
-    return best.record;
-  }
-  return null;
-}
-
-function buildMatchHints(profile = {}) {
-  return {
-    platform: String(profile.platform || ""),
-    mobile: Boolean(profile.mobile),
-    screen: String(profile.screen || ""),
-    colorDepth: Number(profile.colorDepth || 0),
-    pixelRatio: Number(profile.pixelRatio || 0),
-    timezone: String(profile.timezone || ""),
-    language: String(Array.isArray(profile.languages) ? profile.languages[0] || "" : profile.language || ""),
-    maxTouchPoints: Number(profile.maxTouchPoints || 0),
-    hardwareConcurrency: Number(profile.hardwareConcurrency || 0),
-    deviceMemory: Number(profile.deviceMemory || 0),
-    webglVendor: String(profile.webglVendor || ""),
-    webglRenderer: String(profile.webglRenderer || ""),
-    canvasHash: String(profile.canvasHash || "")
-  };
-}
-
-function scoreAttemptMatch(record, candidate, clientIp) {
-  const hints = record.matchHints || {};
-  let score = 0;
-  let anchors = 0;
-
-  if (hints.platform && candidate.platform && hints.platform === candidate.platform) {
-    score += 12;
-    anchors += 1;
-  }
-  if (typeof hints.mobile === "boolean" && typeof candidate.mobile === "boolean" && hints.mobile === candidate.mobile) {
-    score += 8;
-  }
-  if (hints.screen && candidate.screen && hints.screen === candidate.screen) {
-    score += 18;
-    anchors += 1;
-  }
-  if (hints.colorDepth && candidate.colorDepth && hints.colorDepth === candidate.colorDepth) score += 4;
-  if (hints.pixelRatio && candidate.pixelRatio && Math.abs(hints.pixelRatio - candidate.pixelRatio) < 0.01) score += 6;
-  if (hints.timezone && candidate.timezone && hints.timezone === candidate.timezone) score += 4;
-  if (hints.language && candidate.language && hints.language === candidate.language) score += 4;
-  if (hints.maxTouchPoints === candidate.maxTouchPoints) {
-    score += 8;
-    anchors += 1;
-  }
-  if (hints.hardwareConcurrency && candidate.hardwareConcurrency && hints.hardwareConcurrency === candidate.hardwareConcurrency) score += 6;
-  if (hints.deviceMemory && candidate.deviceMemory && hints.deviceMemory === candidate.deviceMemory) score += 5;
-  if (hints.webglVendor && candidate.webglVendor && hints.webglVendor === candidate.webglVendor) score += 8;
-  if (hints.webglRenderer && candidate.webglRenderer && hints.webglRenderer === candidate.webglRenderer) {
-    score += 18;
-    anchors += 2;
-  }
-  if (hints.canvasHash && candidate.canvasHash && hints.canvasHash === candidate.canvasHash) {
-    score += 22;
-    anchors += 2;
-  }
-  if (record.lastSeenIp && clientIp && record.lastSeenIp === clientIp) {
-    score += 10;
-    anchors += 1;
-  }
-
-  return { score, anchors };
+function findAttemptByEmail(store, email) {
+  const normalized = normalizeEmail(email);
+  if (!normalized) return null;
+  return Object.values(store.attempts || {}).find((record) => normalizeEmail(record.verifiedEmail) === normalized) || null;
 }
 
 function createSessionId() {
@@ -295,14 +365,71 @@ function createAttemptId() {
   return `attempt-${crypto.randomBytes(8).toString("hex")}`;
 }
 
-function extractClientIp(req) {
-  const forwarded = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
-  const raw = forwarded || req.socket?.remoteAddress || "";
-  return raw.replace(/^::ffff:/, "");
+function normalizeEmail(value) {
+  return String(value || "").trim().toLowerCase();
 }
 
-function uniqueList(values) {
-  return [...new Set(values)];
+function isValidIitgnEmail(value) {
+  return /^[a-z0-9._%+-]+@iitgn\.ac\.in$/i.test(normalizeEmail(value));
+}
+
+function generateOtp() {
+  return String(crypto.randomInt(100000, 1000000));
+}
+
+function hashOtp(email, otp) {
+  return crypto.createHash("sha256").update(`${normalizeEmail(email)}:${String(otp).trim()}`).digest("hex");
+}
+
+async function sendOtpEmail(email, otp, playerName) {
+  if (!nodemailer) {
+    throw new Error("OTP email service is not installed on the server. Install dependencies first.");
+  }
+  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS || !SMTP_FROM) {
+    throw new Error("SMTP is not configured on the server yet.");
+  }
+
+  const transporter = nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: SMTP_SECURE,
+    auth: {
+      user: SMTP_USER,
+      pass: SMTP_PASS
+    }
+  });
+
+  await transporter.sendMail({
+    from: SMTP_FROM,
+    to: email,
+    subject: "Redline IQ OTP Verification",
+    text: [
+      `Hello ${playerName || "Driver"},`,
+      "",
+      `Your Redline IQ OTP is: ${otp}`,
+      "",
+      "This code is valid for 10 minutes.",
+      "If you did not request this, please ignore this email."
+    ].join("\n"),
+    html: `
+      <div style="font-family:Segoe UI,Tahoma,Verdana,sans-serif;line-height:1.5;color:#0f172a">
+        <p>Hello ${escapeHtml(playerName || "Driver")},</p>
+        <p>Your <strong>Redline IQ</strong> OTP is:</p>
+        <p style="font-size:28px;font-weight:800;letter-spacing:0.18em;margin:16px 0;color:#e11d48">${escapeHtml(otp)}</p>
+        <p>This code is valid for 10 minutes.</p>
+        <p>If you did not request this, please ignore this email.</p>
+      </div>
+    `
+  });
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
 }
 
 function readBody(req) {
