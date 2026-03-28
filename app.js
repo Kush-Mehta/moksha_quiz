@@ -370,8 +370,9 @@ function isValidIitgnEmail(value) {
 }
 
 function setAuthStatus(message, good = false) {
-  el.authStatus.textContent = message;
   el.authStatus.classList.toggle("visible", Boolean(message));
+  el.authStatus.classList.toggle("good", Boolean(message) && Boolean(good));
+  el.authStatus.classList.toggle("bad", Boolean(message) && !good);
   el.authStatus.innerHTML = message ? (good ? `<strong>${escapeHtml(message)}</strong>` : escapeHtml(message)) : "";
 }
 
