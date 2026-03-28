@@ -199,6 +199,7 @@ const POLL_INTERVAL_MS = 5000;
 const STORAGE_VERSION = "2026-03-28-sync-1";
 const STORAGE_PREFIX = `mokshaQuiz:${STORAGE_VERSION}`;
 const DEVICE_KEY = `${STORAGE_PREFIX}:device`;
+const ATTEMPT_ID_KEY = `${STORAGE_PREFIX}:attemptId`;
 const NAME_KEY = `${STORAGE_PREFIX}:name`;
 const ATTEMPT_CACHE_KEY = `${STORAGE_PREFIX}:attemptCache`;
 const SESSION_CACHE_KEY = `${STORAGE_PREFIX}:session`;
@@ -230,6 +231,8 @@ const state = {
   leaderboardSectionIndex: 0,
   sessionUnlocked: false,
   deviceId: getDeviceId(),
+  attemptId: localStorage.getItem(ATTEMPT_ID_KEY) || "",
+  deviceProfile: buildDeviceProfile(),
   leaderboard: [],
   sessionId: localStorage.getItem(SESSION_CACHE_KEY) || "",
   serverAvailable: false,
@@ -339,7 +342,15 @@ async function bootstrapFromServer() {
   }
 
   try {
-    const payload = await fetchJSON(`/api/bootstrap?deviceId=${encodeURIComponent(state.deviceId)}`);
+    const payload = await fetchJSON("/api/bootstrap", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        deviceId: state.deviceId,
+        attemptId: state.attemptId,
+        deviceProfile: state.deviceProfile
+      })
+    });
     const previousSession = localStorage.getItem(SESSION_CACHE_KEY);
     const sessionChanged = Boolean(previousSession && previousSession !== payload.sessionId);
 
@@ -391,6 +402,8 @@ function applyAttemptRecord(record) {
   if (!record) {
     state.locked = false;
     state.sessionUnlocked = false;
+    state.attemptId = "";
+    localStorage.removeItem(ATTEMPT_ID_KEY);
     state.totalScore = 0;
     state.sectionScores = {};
     state.completedSections = [];
@@ -406,6 +419,8 @@ function applyAttemptRecord(record) {
 
   state.locked = true;
   state.sessionUnlocked = true;
+  state.attemptId = record.deviceId || state.attemptId || state.deviceId;
+  localStorage.setItem(ATTEMPT_ID_KEY, state.attemptId);
   state.playerName = record.playerName || state.playerName;
   state.totalScore = Number(record.totalScore) || 0;
   state.sectionScores = record.sectionScores || {};
@@ -441,9 +456,7 @@ function readCachedAttempt() {
   const raw = localStorage.getItem(ATTEMPT_CACHE_KEY);
   if (!raw) return null;
   try {
-    const parsed = JSON.parse(raw);
-    if (parsed.deviceId !== state.deviceId) return null;
-    return parsed;
+    return JSON.parse(raw);
   } catch (error) {
     console.error("Unable to read cached attempt", error);
     return null;
@@ -452,6 +465,7 @@ function readCachedAttempt() {
 
 function clearAttemptCache() {
   localStorage.removeItem(ATTEMPT_CACHE_KEY);
+  localStorage.removeItem(ATTEMPT_ID_KEY);
 }
 
 function saveName() {
@@ -707,9 +721,13 @@ function cacheAttemptLocally() {
 }
 
 function buildAttemptPayload() {
+  const attemptKey = state.attemptId || state.deviceId;
   return {
     sessionId: state.sessionId || localStorage.getItem(SESSION_CACHE_KEY) || "local-session",
-    deviceId: state.deviceId,
+    deviceId: attemptKey,
+    attemptId: attemptKey,
+    browserId: state.deviceId,
+    deviceProfile: state.deviceProfile,
     playerName: state.playerName,
     totalScore: state.totalScore,
     sectionScores: state.sectionScores,
@@ -726,7 +744,8 @@ function updateLocalLeaderboardSnapshot() {
   if (!state.playerName) return;
   const payload = buildAttemptPayload();
   const board = [...state.leaderboard];
-  const idx = board.findIndex((entry) => entry.deviceId === state.deviceId);
+  const attemptKey = payload.deviceId;
+  const idx = board.findIndex((entry) => entry.deviceId === attemptKey);
   if (idx >= 0) board[idx] = { ...board[idx], ...payload };
   else board.push(payload);
   state.leaderboard = sortOverallBoard(board);
@@ -746,6 +765,10 @@ async function syncAttemptToServer() {
     state.serverAvailable = true;
     state.sessionId = response.sessionId || state.sessionId;
     localStorage.setItem(SESSION_CACHE_KEY, state.sessionId);
+    if (response.attempt?.deviceId) {
+      state.attemptId = response.attempt.deviceId;
+      localStorage.setItem(ATTEMPT_ID_KEY, state.attemptId);
+    }
     state.leaderboard = Array.isArray(response.leaderboard) ? response.leaderboard : state.leaderboard;
     setServerStatus("Live server sync is on.", true);
     renderLeaderboard();
@@ -766,7 +789,7 @@ function renderLeaderboard() {
 
   rankedBoard.forEach((entry, index) => {
     const row = document.createElement("div");
-    row.className = `leader-row${entry.deviceId === state.deviceId ? " current" : ""}`;
+    row.className = `leader-row${entry.deviceId === (state.attemptId || state.deviceId) ? " current" : ""}`;
     const currentScore = state.leaderboardMode === "overall" ? Number(entry.totalScore || 0) : getSectionScore(entry.sectionScores, state.leaderboardSectionIndex);
     row.innerHTML = `
       <div class="rank">#${index + 1}</div>
@@ -866,10 +889,88 @@ function escapeHtml(value) {
 function getDeviceId() {
   let value = localStorage.getItem(DEVICE_KEY);
   if (!value) {
-    value = [navigator.userAgent, navigator.language, screen.width, screen.height, Intl.DateTimeFormat().resolvedOptions().timeZone, Math.random().toString(36).slice(2)].join("|");
+    value = `browser-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
     localStorage.setItem(DEVICE_KEY, value);
   }
   return hashString(value);
+}
+
+function buildDeviceProfile() {
+  const nav = window.navigator || {};
+  const screenInfo = window.screen || {};
+  const orderedScreen = [Number(screenInfo.width || 0), Number(screenInfo.height || 0)].sort((a, b) => b - a);
+  const { vendor, renderer } = getWebGLInfo();
+  const profile = {
+    platform: normalizePlatform(nav.userAgentData?.platform || nav.platform || nav.userAgent || ""),
+    mobile: Boolean(nav.userAgentData?.mobile ?? /Android|iPhone|iPad|iPod|Mobile/i.test(nav.userAgent || "")),
+    screen: orderedScreen.join("x"),
+    colorDepth: Number(screenInfo.colorDepth || 0),
+    pixelRatio: Number(window.devicePixelRatio || 1),
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "",
+    languages: Array.isArray(nav.languages) ? nav.languages.slice(0, 4) : [nav.language].filter(Boolean),
+    maxTouchPoints: Number(nav.maxTouchPoints || 0),
+    hardwareConcurrency: Number(nav.hardwareConcurrency || 0),
+    deviceMemory: Number(nav.deviceMemory || 0),
+    webglVendor: vendor,
+    webglRenderer: renderer,
+    canvasHash: getCanvasFingerprint()
+  };
+  profile.stableKey = hashString(JSON.stringify(profile));
+  return profile;
+}
+
+function normalizePlatform(value) {
+  const text = String(value || "").toLowerCase();
+  if (text.includes("iphone") || text.includes("ipad") || text.includes("ios")) return "ios";
+  if (text.includes("android")) return "android";
+  if (text.includes("mac")) return "mac";
+  if (text.includes("win")) return "windows";
+  if (text.includes("linux")) return "linux";
+  return text.replace(/[^a-z0-9]+/g, "-").slice(0, 24) || "unknown";
+}
+
+function getCanvasFingerprint() {
+  try {
+    const canvas = document.createElement("canvas");
+    const context = canvas.getContext("2d");
+    if (!context) return "";
+    canvas.width = 240;
+    canvas.height = 56;
+    context.textBaseline = "top";
+    context.font = "700 19px Arial";
+    context.fillStyle = "#ff304f";
+    context.fillRect(12, 10, 140, 18);
+    context.fillStyle = "#07111f";
+    context.fillText("Redline IQ / Moksha", 14, 14);
+    context.strokeStyle = "#62e6a7";
+    context.beginPath();
+    context.arc(200, 28, 14, 0, Math.PI * 2);
+    context.stroke();
+    return hashString(canvas.toDataURL());
+  } catch (error) {
+    return "";
+  }
+}
+
+function getWebGLInfo() {
+  try {
+    const canvas = document.createElement("canvas");
+    const gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
+    if (!gl) return { vendor: "", renderer: "" };
+    const debugInfo = gl.getExtension("WEBGL_debug_renderer_info");
+    if (!debugInfo) {
+      return {
+        vendor: String(gl.getParameter(gl.VENDOR) || ""),
+        renderer: String(gl.getParameter(gl.RENDERER) || "")
+      };
+    }
+    return {
+      vendor: String(gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL) || ""),
+      renderer: String(gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) || "")
+    };
+  } catch (error) {
+    return { vendor: "", renderer: "" };
+  }
 }
 
 function hashString(input) {

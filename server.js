@@ -45,11 +45,13 @@ server.listen(PORT, () => {
 });
 
 async function handleApi(req, res, requestUrl) {
-  if (req.method === "GET" && requestUrl.pathname === "/api/bootstrap") {
-    const deviceId = requestUrl.searchParams.get("deviceId") || "";
+  if ((req.method === "GET" || req.method === "POST") && requestUrl.pathname === "/api/bootstrap") {
+    const payload = req.method === "POST"
+      ? JSON.parse((await readBody(req)) || "{}")
+      : { deviceId: requestUrl.searchParams.get("deviceId") || "" };
     const store = readStore();
     const leaderboard = buildLeaderboard(store);
-    const attempt = deviceId ? store.attempts[deviceId] || null : null;
+    const attempt = findMatchingAttempt(store, payload, req);
     sendJson(res, 200, {
       sessionId: store.sessionId,
       leaderboard,
@@ -69,9 +71,13 @@ async function handleApi(req, res, requestUrl) {
 
     const store = readStore();
     const now = new Date().toISOString();
+    const matchedRecord = findMatchingAttempt(store, payload, req);
+    const attemptId = matchedRecord?.deviceId || String(payload.attemptId || payload.deviceId || createAttemptId());
+    const browserId = String(payload.browserId || payload.deviceId || "");
+    const matchHints = buildMatchHints(payload.deviceProfile);
     const record = {
       sessionId: store.sessionId,
-      deviceId: String(payload.deviceId),
+      deviceId: attemptId,
       playerName: String(payload.playerName).trim().slice(0, 30),
       totalScore: Number(payload.totalScore || 0),
       sectionScores: payload.sectionScores && typeof payload.sectionScores === "object" ? payload.sectionScores : {},
@@ -79,8 +85,12 @@ async function handleApi(req, res, requestUrl) {
       completedAll: Boolean(payload.completedAll),
       inProgressSectionIndex: Number.isInteger(payload.inProgressSectionIndex) ? payload.inProgressSectionIndex : null,
       inProgressQuestionIndex: Number.isInteger(payload.inProgressQuestionIndex) ? payload.inProgressQuestionIndex : null,
-      startedAt: payload.startedAt || now,
-      updatedAt: now
+      startedAt: matchedRecord?.startedAt || payload.startedAt || now,
+      updatedAt: now,
+      browserIds: uniqueList([...(matchedRecord?.browserIds || []), browserId].filter(Boolean)),
+      deviceStableKey: String(payload.deviceProfile?.stableKey || matchedRecord?.deviceStableKey || ""),
+      matchHints,
+      lastSeenIp: extractClientIp(req)
     };
 
     store.attempts[record.deviceId] = record;
@@ -177,8 +187,122 @@ function buildLeaderboard(store) {
   }).slice(0, 100);
 }
 
+function findMatchingAttempt(store, payload, req) {
+  const attempts = Object.values(store.attempts || {});
+  if (!attempts.length) return null;
+
+  const explicitIds = uniqueList([
+    payload?.attemptId,
+    payload?.deviceId,
+    payload?.browserId
+  ].filter(Boolean).map(String));
+
+  for (const id of explicitIds) {
+    if (store.attempts[id]) return store.attempts[id];
+  }
+
+  const stableKey = String(payload?.deviceProfile?.stableKey || "");
+  if (stableKey) {
+    const exactStableMatch = attempts.find((record) => record.deviceStableKey && record.deviceStableKey === stableKey);
+    if (exactStableMatch) return exactStableMatch;
+  }
+
+  const candidateHints = buildMatchHints(payload?.deviceProfile);
+  const clientIp = extractClientIp(req);
+  let best = null;
+  let bestScore = 0;
+
+  for (const record of attempts) {
+    const { score, anchors } = scoreAttemptMatch(record, candidateHints, clientIp);
+    if (score > bestScore || (score === bestScore && anchors > (best?.anchors || 0))) {
+      best = { record, anchors };
+      bestScore = score;
+    }
+  }
+
+  if (best && bestScore >= 70 && best.anchors >= 3) {
+    return best.record;
+  }
+  return null;
+}
+
+function buildMatchHints(profile = {}) {
+  return {
+    platform: String(profile.platform || ""),
+    mobile: Boolean(profile.mobile),
+    screen: String(profile.screen || ""),
+    colorDepth: Number(profile.colorDepth || 0),
+    pixelRatio: Number(profile.pixelRatio || 0),
+    timezone: String(profile.timezone || ""),
+    language: String(Array.isArray(profile.languages) ? profile.languages[0] || "" : profile.language || ""),
+    maxTouchPoints: Number(profile.maxTouchPoints || 0),
+    hardwareConcurrency: Number(profile.hardwareConcurrency || 0),
+    deviceMemory: Number(profile.deviceMemory || 0),
+    webglVendor: String(profile.webglVendor || ""),
+    webglRenderer: String(profile.webglRenderer || ""),
+    canvasHash: String(profile.canvasHash || "")
+  };
+}
+
+function scoreAttemptMatch(record, candidate, clientIp) {
+  const hints = record.matchHints || {};
+  let score = 0;
+  let anchors = 0;
+
+  if (hints.platform && candidate.platform && hints.platform === candidate.platform) {
+    score += 12;
+    anchors += 1;
+  }
+  if (typeof hints.mobile === "boolean" && typeof candidate.mobile === "boolean" && hints.mobile === candidate.mobile) {
+    score += 8;
+  }
+  if (hints.screen && candidate.screen && hints.screen === candidate.screen) {
+    score += 18;
+    anchors += 1;
+  }
+  if (hints.colorDepth && candidate.colorDepth && hints.colorDepth === candidate.colorDepth) score += 4;
+  if (hints.pixelRatio && candidate.pixelRatio && Math.abs(hints.pixelRatio - candidate.pixelRatio) < 0.01) score += 6;
+  if (hints.timezone && candidate.timezone && hints.timezone === candidate.timezone) score += 4;
+  if (hints.language && candidate.language && hints.language === candidate.language) score += 4;
+  if (hints.maxTouchPoints === candidate.maxTouchPoints) {
+    score += 8;
+    anchors += 1;
+  }
+  if (hints.hardwareConcurrency && candidate.hardwareConcurrency && hints.hardwareConcurrency === candidate.hardwareConcurrency) score += 6;
+  if (hints.deviceMemory && candidate.deviceMemory && hints.deviceMemory === candidate.deviceMemory) score += 5;
+  if (hints.webglVendor && candidate.webglVendor && hints.webglVendor === candidate.webglVendor) score += 8;
+  if (hints.webglRenderer && candidate.webglRenderer && hints.webglRenderer === candidate.webglRenderer) {
+    score += 18;
+    anchors += 2;
+  }
+  if (hints.canvasHash && candidate.canvasHash && hints.canvasHash === candidate.canvasHash) {
+    score += 22;
+    anchors += 2;
+  }
+  if (record.lastSeenIp && clientIp && record.lastSeenIp === clientIp) {
+    score += 10;
+    anchors += 1;
+  }
+
+  return { score, anchors };
+}
+
 function createSessionId() {
   return crypto.randomBytes(12).toString("hex");
+}
+
+function createAttemptId() {
+  return `attempt-${crypto.randomBytes(8).toString("hex")}`;
+}
+
+function extractClientIp(req) {
+  const forwarded = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  const raw = forwarded || req.socket?.remoteAddress || "";
+  return raw.replace(/^::ffff:/, "");
+}
+
+function uniqueList(values) {
+  return [...new Set(values)];
 }
 
 function readBody(req) {
