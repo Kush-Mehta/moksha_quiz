@@ -196,6 +196,7 @@ const QUESTION_TIME = 15;
 const BASE_POINTS = 50;
 const TIME_BONUS = 4;
 const POLL_INTERVAL_MS = 5000;
+const REQUEST_TIMEOUT_MS = 20000;
 const STORAGE_VERSION = "2026-03-28-sync-1";
 const STORAGE_PREFIX = `mokshaQuiz:${STORAGE_VERSION}`;
 const DEVICE_KEY = `${STORAGE_PREFIX}:device`;
@@ -1096,8 +1097,21 @@ function setServerStatus(message, good) {
   el.serverStatus.setAttribute("aria-label", message || (good ? "Server online" : "Server offline"));
 }
 
-async function fetchJSON(url, options) {
-  const response = await fetch(url, options);
+async function fetchJSON(url, options = {}) {
+  const { timeoutMs = REQUEST_TIMEOUT_MS, ...fetchOptions } = options;
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+  let response;
+  try {
+    response = await fetch(url, { ...fetchOptions, signal: controller.signal });
+  } catch (error) {
+    window.clearTimeout(timeoutId);
+    if (error && error.name === "AbortError") {
+      throw new Error("Request timed out. Please try again.");
+    }
+    throw error;
+  }
+  window.clearTimeout(timeoutId);
   let payload = {};
   try {
     payload = await response.json();
