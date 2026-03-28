@@ -239,6 +239,9 @@ const state = {
   email: localStorage.getItem(EMAIL_KEY) || "",
   emailVerified: localStorage.getItem(EMAIL_VERIFIED_KEY) === "1",
   quizStarted: false,
+  authStatusMessage: "",
+  authStatusGood: false,
+  authStatusSticky: false,
   leaderboard: [],
   sessionId: localStorage.getItem(SESSION_CACHE_KEY) || "",
   serverAvailable: false,
@@ -369,11 +372,28 @@ function isValidIitgnEmail(value) {
   return /^[a-z0-9._%+-]+@iitgn\.ac\.in$/i.test(normalizeEmail(value));
 }
 
-function setAuthStatus(message, good = false) {
+function renderAuthStatus() {
+  const message = state.authStatusMessage || "";
+  const good = Boolean(state.authStatusGood);
   el.authStatus.classList.toggle("visible", Boolean(message));
-  el.authStatus.classList.toggle("good", Boolean(message) && Boolean(good));
+  el.authStatus.classList.toggle("good", Boolean(message) && good);
   el.authStatus.classList.toggle("bad", Boolean(message) && !good);
   el.authStatus.innerHTML = message ? (good ? `<strong>${escapeHtml(message)}</strong>` : escapeHtml(message)) : "";
+}
+
+function setAuthStatus(message, good = false, sticky = true) {
+  state.authStatusMessage = message || "";
+  state.authStatusGood = Boolean(message) && Boolean(good);
+  state.authStatusSticky = Boolean(message) && Boolean(sticky);
+  renderAuthStatus();
+}
+
+function setDefaultAuthStatus(message, good = false) {
+  if (state.authStatusSticky && state.authStatusMessage) return;
+  state.authStatusMessage = message || "";
+  state.authStatusGood = Boolean(message) && Boolean(good);
+  state.authStatusSticky = false;
+  renderAuthStatus();
 }
 
 function updateAuthUI() {
@@ -384,10 +404,10 @@ function updateAuthUI() {
   el.otpCode.disabled = verified || !state.serverAvailable || window.location.protocol === "file:";
   el.verifyOtpBtn.disabled = verified || !state.serverAvailable || window.location.protocol === "file:";
   if (verified) {
-    setAuthStatus(`Verified: ${state.email}`, true);
+    setAuthStatus(`Verified: ${state.email}`, true, true);
     el.otpCode.value = "";
-  } else if (!el.authStatus.textContent) {
-    setAuthStatus("");
+  } else if (!state.authStatusMessage) {
+    renderAuthStatus();
   }
 }
 
@@ -397,7 +417,7 @@ async function bootstrapFromServer() {
     const cachedAttempt = readCachedAttempt();
     if (cachedAttempt && state.currentSectionIndex === null) applyAttemptRecord(cachedAttempt);
     setServerStatus("Open this page through the server URL to sync scores live.", false);
-    setAuthStatus("Open this page through the live server URL to verify your IITGN email.");
+    setDefaultAuthStatus("Open this page through the live server URL to verify your IITGN email.");
     updateHeaderBits();
     updateAuthUI();
     renderSections();
@@ -443,14 +463,14 @@ async function bootstrapFromServer() {
 
     setServerStatus("Live server sync is on.", true);
     if (!payload.attempt && !state.emailVerified) {
-      setAuthStatus("Use your IITGN email to get an OTP and unlock the quiz.");
+      setDefaultAuthStatus("Use your IITGN email to get an OTP and unlock the quiz.");
     }
   } catch (error) {
     state.serverAvailable = false;
     const cachedAttempt = readCachedAttempt();
     if (cachedAttempt && state.currentSectionIndex === null) applyAttemptRecord(cachedAttempt);
     setServerStatus("Live server not reachable. Shared sync is paused until it reconnects.", false);
-    if (!state.emailVerified) setAuthStatus("Live server unavailable. Email OTP verification is paused.");
+    if (!state.emailVerified) setDefaultAuthStatus("Live server unavailable. Email OTP verification is paused.");
   }
 
   updateHeaderBits();
