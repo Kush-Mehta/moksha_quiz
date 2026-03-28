@@ -19,6 +19,8 @@ const SMTP_USER = process.env.SMTP_USER || "";
 const SMTP_PASS = process.env.SMTP_PASS || "";
 const SMTP_FROM = process.env.SMTP_FROM || SMTP_USER || "";
 const SMTP_TIMEOUT_MS = Number(process.env.SMTP_TIMEOUT_MS || 15000);
+const BREVO_API_KEY = process.env.BREVO_API_KEY || "";
+const BREVO_API_TIMEOUT_MS = Number(process.env.BREVO_API_TIMEOUT_MS || 15000);
 const OTP_TTL_MS = Number(process.env.OTP_TTL_MS || 10 * 60 * 1000);
 const OTP_COOLDOWN_MS = Number(process.env.OTP_COOLDOWN_MS || 45 * 1000);
 const ROOT = __dirname;
@@ -393,6 +395,10 @@ function hashOtp(email, otp) {
 }
 
 async function sendOtpEmail(email, otp, playerName) {
+  if (BREVO_API_KEY) {
+    await sendOtpViaBrevoApi(email, otp, playerName);
+    return;
+  }
   if (!nodemailer) {
     throw new Error("OTP email service is not installed on the server. Install dependencies first.");
   }
@@ -435,6 +441,86 @@ async function sendOtpEmail(email, otp, playerName) {
       </div>
     `
   });
+}
+
+async function sendOtpViaBrevoApi(email, otp, playerName) {
+  if (typeof fetch !== "function") {
+    throw new Error("Server fetch API is unavailable for Brevo delivery.");
+  }
+
+  const sender = parseSender(SMTP_FROM || SMTP_USER);
+  if (!sender.email) {
+    throw new Error("SMTP_FROM must contain a valid sender email for Brevo delivery.");
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), BREVO_API_TIMEOUT_MS);
+
+  try {
+    const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "api-key": BREVO_API_KEY,
+        Accept: "application/json"
+      },
+      body: JSON.stringify({
+        sender,
+        to: [{ email }],
+        subject: "Redline IQ OTP Verification",
+        textContent: [
+          `Hello ${playerName || "Driver"},`,
+          "",
+          `Your Redline IQ OTP is: ${otp}`,
+          "",
+          "This code is valid for 10 minutes.",
+          "If you did not request this, please ignore this email."
+        ].join("\n"),
+        htmlContent: `
+          <div style="font-family:Segoe UI,Tahoma,Verdana,sans-serif;line-height:1.5;color:#0f172a">
+            <p>Hello ${escapeHtml(playerName || "Driver")},</p>
+            <p>Your <strong>Redline IQ</strong> OTP is:</p>
+            <p style="font-size:28px;font-weight:800;letter-spacing:0.18em;margin:16px 0;color:#e11d48">${escapeHtml(otp)}</p>
+            <p>This code is valid for 10 minutes.</p>
+            <p>If you did not request this, please ignore this email.</p>
+          </div>
+        `
+      }),
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      let details = "";
+      try {
+        details = await response.text();
+      } catch (error) {
+        details = "";
+      }
+      throw new Error(details || `Brevo API request failed with status ${response.status}.`);
+    }
+  } catch (error) {
+    if (error && error.name === "AbortError") {
+      throw new Error("Brevo API connection timed out.");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+function parseSender(value) {
+  const raw = String(value || "").trim();
+  const match = raw.match(/^(.*)<([^>]+)>$/);
+  if (match) {
+    return {
+      name: match[1].trim().replace(/^"|"$/g, "") || "Redline IQ",
+      email: match[2].trim()
+    };
+  }
+  return {
+    name: "Redline IQ",
+    email: raw
+  };
 }
 
 function escapeHtml(value) {
